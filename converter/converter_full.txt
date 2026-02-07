@@ -1,0 +1,198 @@
+# Folder structure for converter
+
+src/converter/
+├── consumer.py
+├── convert/
+│   ├── __init__.py
+│   └── to_mp3.py
+├── converter_all_code.txt
+├── Dockerfile
+├── manifests/
+│   ├── configmap.yaml
+│   ├── converter-deploy.yaml
+│   └── secret.yaml
+├── requirements.txt
+
+# consumer.py
+import pika, sys, os, time
+from pymongo import MongoClient
+import gridfs
+from convert import to_mp3
+
+
+def main():
+    client = MongoClient("host.minikube.internal", 27017)
+    db_videos = client.videos
+    db_mp3s = client.mp3s
+    # gridfs
+    fs_videos = gridfs.GridFS(db_videos)
+    fs_mp3s = gridfs.GridFS(db_mp3s)
+
+    # rabbitmq connection
+    connection = pika.BlockingConnection(pika.ConnectionParameters(host="rabbitmq"))
+    channel = connection.channel()
+
+    def callback(ch, method, properties, body):
+        err = to_mp3.start(body, fs_videos, fs_mp3s, ch)
+        if err:
+            ch.basic_nack(delivery_tag=method.delivery_tag)
+        else:
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+
+    channel.basic_consume(
+        queue=os.environ.get("VIDEO_QUEUE"), on_message_callback=callback
+    )
+
+    print("Waiting for messages. To exit press CTRL+C")
+
+    channel.start_consuming()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Interrupted")
+        try:
+            sys.exit(0)
+        except SystemExit:
+            os._exit(0)
+
+
+# convert/to_mp3.py
+import pika, json, tempfile, os
+from bson.objectid import ObjectId
+import moviepy.editor
+
+
+def start(message, fs_videos, fs_mp3s, channel):
+    message = json.loads(message)
+
+    # empty temp file
+    tf = tempfile.NamedTemporaryFile()
+    # video contents
+    out = fs_videos.get(ObjectId(message["video_fid"]))
+    # add video contents to empty file
+    tf.write(out.read())
+    # create audio from temp video file
+    audio = moviepy.editor.VideoFileClip(tf.name).audio
+    tf.close()
+
+    # write audio to the file
+    tf_path = tempfile.gettempdir() + f"/{message['video_fid']}.mp3"
+    audio.write_audiofile(tf_path)
+
+    # save file to mongo
+    f = open(tf_path, "rb")
+    data = f.read()
+    fid = fs_mp3s.put(data)
+    f.close()
+    os.remove(tf_path)
+
+    message["mp3_fid"] = str(fid)
+
+    try:
+        channel.basic_publish(
+            exchange="",
+            routing_key=os.environ.get("MP3_QUEUE"),
+            body=json.dumps(message),
+            properties=pika.BasicProperties(
+                delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
+            ),
+        )
+    except Exception as err:
+        fs_mp3s.delete(fid)
+        return "failed to publish message"
+
+
+# convert/__init__.py
+(empty)
+
+# requirements.txt
+astroid==2.9.3
+certifi==2021.10.8
+charset-normalizer==2.0.12
+decorator==4.4.2
+idna==3.3
+imageio==2.16.0
+imageio-ffmpeg==0.4.5
+isort==5.10.1
+jedi==0.18.1
+lazy-object-proxy==1.7.1
+mccabe==0.6.1
+moviepy==1.0.3
+numpy==1.22.2
+parso==0.8.3
+pika==1.2.0
+Pillow==9.0.1
+platformdirs==2.5.1
+proglog==0.1.9
+pylint==2.12.2
+pymongo==4.0.1
+requests==2.27.1
+toml==0.10.2
+tqdm==4.62.3
+urllib3==1.26.8
+wrapt==1.13.3
+
+# Dockerfile
+FROM python:3.10-slim-bullseye
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends --no-install-suggests \
+  build-essential ffmpeg \
+  && pip install --no-cache-dir --upgrade pip
+
+WORKDIR /app
+COPY ./requirements.txt /app
+RUN pip install --no-cache-dir --requirement /app/requirements.txt
+COPY . /app
+
+CMD ["python3", "consumer.py"]
+
+# manifests/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: converter-configmap
+data:
+  MP3_QUEUE: "mp3"
+  VIDEO_QUEUE: "video"
+
+# manifests/converter-deploy.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: converter
+  labels:
+    app: converter
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: converter
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 8
+  template:
+    metadata:
+      labels:
+        app: converter
+    spec:
+      containers:
+        - name: converter
+          image: kushagra0717/converter
+          envFrom:
+            - configMapRef:
+                name: converter-configmap
+            - secretRef:
+                name: converter-secret
+
+# manifests/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: converter-secret
+stringData:
+  PLACEHOLDER: "NONE"
+type: Opaque

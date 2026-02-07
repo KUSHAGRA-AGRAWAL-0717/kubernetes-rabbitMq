@@ -1,0 +1,462 @@
+# Folder structure for gateway
+
+src/gateway/
+├── Dockerfile
+├── gateway_all_code.txt
+├── requirements.txt
+├── server.py
+├── auth/
+│   ├── __init__.py
+│   └── validate.py
+├── auth_svc/
+│   ├── __init__.py
+│   └── access.py
+├── manifests/
+│   ├── configmap.yaml
+│   ├── gateway-deploy.yaml
+│   ├── ingress.yaml
+│   ├── secret.yaml
+│   └── service.yaml
+├── storage/
+│   ├── __init__.py
+│   └── util.py
+
+# server.py
+import os, gridfs, pika, json
+from flask import Flask, request, send_file
+from flask_pymongo import PyMongo
+from auth import validate
+from auth_svc import access
+from storage import util
+from bson.objectid import ObjectId
+
+server = Flask(__name__)
+
+mongo_video = PyMongo(server, uri="mongodb://host.minikube.internal:27017/videos")
+
+mongo_mp3 = PyMongo(server, uri="mongodb://host.minikube.internal:27017/mp3s")
+
+fs_videos = gridfs.GridFS(mongo_video.db)
+fs_mp3s = gridfs.GridFS(mongo_mp3.db)
+
+connection = pika.BlockingConnection(pika.ConnectionParameters("rabbitmq"))
+channel = connection.channel()
+
+
+@server.route("/login", methods=["POST"])
+def login():
+    token, err = access.login(request)
+
+    if not err:
+        return token
+    else:
+        return err
+
+
+@server.route("/upload", methods=["POST"])
+def upload():
+    access, err = validate.token(request)
+
+    if err:
+        return err
+
+    access = json.loads(access)
+
+    if access["admin"]:
+        if len(request.files) > 1 or len(request.files) < 1:
+            return "exactly 1 file required", 400
+
+        for _, f in request.files.items():
+            err = util.upload(f, fs_videos, channel, access)
+
+            if err:
+                return err
+
+        return "success!", 200
+    else:
+        return "not authorized", 401
+
+
+@server.route("/download", methods=["GET"])
+def download():
+    access, err = validate.token(request)
+
+    if err:
+        return err
+
+    access = json.loads(access)
+
+    if access["admin"]:
+        fid_string = request.args.get("fid")
+
+        if not fid_string:
+            return "fid is required", 400
+
+        try:
+            out = fs_mp3s.get(ObjectId(fid_string))
+            return send_file(out, download_name=f"{fid_string}.mp3")
+        except Exception as err:
+            print(err)
+            return "internal server error", 500
+
+    return "not authorized", 401
+
+
+if __name__ == "__main__":
+    server.run(host="0.0.0.0", port=8080)
+
+
+storage/util.py:
+import pika, json
+
+
+def upload(f, fs, channel, access):
+    try:
+        fid = fs.put(f)
+    except Exception as err:
+        print(err)
+        return "internal server error", 500
+
+    message = {
+        "video_fid": str(fid),
+        "mp3_fid": None,
+        "username": access["username"],
+    }
+
+    try:
+        channel.basic_publish(
+            exchange="",
+            routing_key="video",
+            body=json.dumps(message),
+            properties=pika.BasicProperties(
+                delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
+            ),
+        )
+    except Exception as err:
+        print(err)
+        fs.delete(fid)
+        return "internal server error", 500
+    
+
+manifests/
+configmap.yaml:
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gateway-configmap
+data:
+  AUTH_SVC_ADDRESS: "auth:5000"
+
+manifests/
+gateway-deploy.yaml:
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  labels:
+    app: gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 3
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      containers:
+        - name: gateway
+          image: kushagra0717/gateway
+          envFrom:
+            - configMapRef:
+                name: gateway-configmap
+            - secretRef:
+                name: gateway-secret
+
+manifests/
+ingress.yaml:
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: gateway-ingress
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    #nginx.ingress.kubernetes.io/proxy-max-temp-file-size: "1024m"
+spec:
+  rules:
+    - host: mp3converter.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: gateway
+                port:
+                  number: 8080
+
+manifests/
+secret.yaml:
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gateway-secret
+stringData:
+  PLACEHOLDER: nothing
+type: Opaque
+
+manifests/
+Service.yaml:
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+spec:
+  selector:
+    app: gateway
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+
+auth_svc/
+access.py:
+import os, requests
+
+
+def login(request):
+    auth = request.authorization
+    if not auth:
+        return None, ("missing credentials", 401)
+
+    basicAuth = (auth.username, auth.password)
+
+    response = requests.post(
+        f"http://{os.environ.get('AUTH_SVC_ADDRESS')}/login", auth=basicAuth
+    )
+
+    if response.status_code == 200:
+        return response.text, None
+    else:
+        return None, (response.text, response.status_code)
+
+
+auth/
+validate.py:
+import os, requests
+
+
+def token(request):
+    if not "Authorization" in request.headers:
+        return None, ("missing credentials", 401)
+
+    token = request.headers["Authorization"]
+
+    if not token:
+        return None, ("missing credentials", 401)
+
+    response = requests.post(
+        f"http://{os.environ.get('AUTH_SVC_ADDRESS')}/validate",
+        headers={"Authorization": token},
+    )
+
+    if response.status_code == 200:
+        return response.text, None
+    else:
+        return None, (response.text, response.status_code)
+
+
+
+
+# requirements.txt
+astroid==2.9.3
+certifi==2021.10.8
+charset-normalizer==2.0.11
+click==8.0.3
+Flask==2.0.2
+Flask-PyMongo==2.3.0
+idna==3.3
+isort==5.10.1
+itsdangerous==2.0.1
+jedi==0.18.1
+Jinja2==3.0.3
+lazy-object-proxy==1.7.1
+MarkupSafe==2.0.1
+mccabe==0.6.1
+parso==0.8.3
+pika==1.2.0
+platformdirs==2.5.0
+pylint==2.12.2
+pymongo==4.0.1
+requests==2.27.1
+toml==0.10.2
+urllib3==1.26.8
+Werkzeug==2.0.3
+wrapt==1.13.3
+
+# auth/validate.py
+import os, requests
+
+def token(request):
+    if not "Authorization" in request.headers:
+        return None, ("missing credentials", 401)
+    token = request.headers["Authorization"]
+    if not token:
+        return None, ("missing credentials", 401)
+    response = requests.post(
+        f"http://{os.environ.get('AUTH_SVC_ADDRESS')}/validate",
+        headers={"Authorization": token},
+    )
+    if response.status_code == 200:
+        return response.text, None
+    else:
+        return None, (response.text, response.status_code)
+
+# auth/ __init__.py
+(empty)
+
+# auth_svc/access.py
+import os, requests
+
+def login(request):
+    auth = request.authorization
+    if not auth:
+        return None, ("missing credentials", 401)
+    basicAuth = (auth.username, auth.password)
+    response = requests.post(
+        f"http://{os.environ.get('AUTH_SVC_ADDRESS')}/login", auth=basicAuth
+    )
+    if response.status_code == 200:
+        return response.text, None
+    else:
+        return None, (response.text, response.status_code)
+
+# auth_svc/__init__.py
+(empty)
+
+# storage/util.py
+import pika, json
+
+def upload(f, fs, channel, access):
+    try:
+        fid = fs.put(f.read(), filename=f.filename)
+    except Exception as err:
+        print(err)
+        return "internal server error", 500
+    message = {
+        "video_fid": str(fid),
+        "mp3_fid": None,
+        "username": access["username"],
+    }
+    try:
+        channel.basic_publish(
+            exchange="",
+            queue="video",
+            durable=True,
+            body=json.dumps(message),
+            properties=pika.BasicProperties(
+                delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE
+            ),
+        )
+    except Exception as err:
+        print(err)
+        fs.delete(fid)
+        return "internal server error", 500
+
+# storage/__init__.py
+(empty)
+
+# Kubernetes Manifests
+
+# configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+    name: gateway-configmap
+data:
+    AUTH_SVC_ADDRESS: "auth:5000"
+
+# gateway-deploy.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: gateway
+    labels:
+        app: gateway
+spec:
+    replicas: 2
+    selector:
+        matchLabels:
+            app: gateway
+    strategy:
+        type: RollingUpdate
+        rollingUpdate:
+            maxSurge: 3
+    template:
+        metadata:
+            labels:
+                app: gateway
+        spec:
+            containers:
+                - name: gateway
+                    image: kushagra0717/gateway
+                    envFrom:
+                        - configMapRef:
+                                name: gateway-configmap
+                        - secretRef:
+                                name: gateway-secret
+
+# ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+    name: gateway-ingress
+    annotations:
+        nginx.ingress.kubernetes.io/proxy-body-size: "0"
+        nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+        nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+        #nginx.ingress.kubernetes.io/proxy-max-temp-file-size: "1024m"
+spec:
+    rules:
+        - host: mp3converter.com
+            http:
+                paths:
+                    - path: /
+                        pathType: Prefix
+                        backend:
+                            service:
+                                name: gateway
+                                port:
+                                    number: 8080
+
+# secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+    name: gateway-secret
+stringData:
+    PLACEHOLDER: nothing
+type: Opaque
+
+# service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+    name: gateway
+spec:
+    selector:
+        app: gateway
+    type: ClusterIP
+    ports:
+        - port: 8080
+            targetPort: 8080
+            protocol: TCP
+# Combined Python code from all files under gateway folder

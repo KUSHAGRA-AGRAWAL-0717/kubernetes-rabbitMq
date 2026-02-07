@@ -1,0 +1,213 @@
+# Folder structure for auth
+
+src/auth/
+├── Dockerfile
+├── init.sql
+├── manifests/
+│   ├── auth-deploy.yaml
+│   ├── configmap.yaml
+│   ├── secret.yaml
+│   └── service.yaml
+├── requirements.txt
+├── server.py
+
+# server.py
+import jwt, datetime, os
+from flask import Flask, request
+from flask_mysqldb import MySQL
+
+server = Flask(__name__)
+mysql = MySQL(server)
+
+# config
+server.config["MYSQL_HOST"] = os.environ.get("MYSQL_HOST")
+server.config["MYSQL_USER"] = os.environ.get("MYSQL_USER")
+server.config["MYSQL_PASSWORD"] = os.environ.get("MYSQL_PASSWORD")
+server.config["MYSQL_DB"] = os.environ.get("MYSQL_DB")
+server.config["MYSQL_PORT"] = int(os.environ.get("MYSQL_PORT"))
+
+
+@server.route("/login", methods=["POST"])
+def login():
+    auth = request.authorization
+    if not auth:
+        return "missing credentials", 401
+
+    # check db for username and password
+    cur = mysql.connection.cursor()
+    res = cur.execute(
+        "SELECT email, password FROM user WHERE email=%s", (auth.username,)
+    )
+
+    if res > 0:
+        user_row = cur.fetchone()
+        email = user_row[0]
+        password = user_row[1]
+
+        if auth.username != email or auth.password != password:
+            return "invalid credentials", 401
+        else:
+            return createJWT(auth.username, os.environ.get("JWT_SECRET"), True)
+    else:
+        return "invalid credentials", 401
+
+
+@server.route("/validate", methods=["POST"])
+def validate():
+    encoded_jwt = request.headers["Authorization"]
+
+    if not encoded_jwt:
+        return "missing credentials", 401
+
+    encoded_jwt = encoded_jwt.split(" ")[1]
+
+    try:
+        decoded = jwt.decode(
+            encoded_jwt, os.environ.get("JWT_SECRET"), algorithms=["HS256"]
+        )
+    except:
+        return "not authorized", 403
+
+    return decoded, 200
+
+
+def createJWT(username, secret, authz):
+    return jwt.encode(
+        {
+            "username": username,
+            "exp": datetime.datetime.now(tz=datetime.timezone.utc)
+            + datetime.timedelta(days=1),
+            "iat": datetime.datetime.utcnow(),
+            "admin": authz,
+        },
+        secret,
+        algorithm="HS256",
+    )
+
+
+if __name__ == "__main__":
+    server.run(host="0.0.0.0", port=5000)
+
+
+# Dockerfile
+FROM python:3.10-slim-bullseye
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends --no-install-suggests \
+  build-essential default-libmysqlclient-dev pkg-config \
+  && pip install --no-cache-dir --upgrade pip
+
+WORKDIR /app
+COPY ./requirements.txt /app
+RUN pip install --no-cache-dir --requirement /app/requirements.txt
+COPY . /app
+
+EXPOSE 5000
+
+CMD ["python3", "server.py"]
+
+# init.sql
+CREATE USER IF NOT EXISTS 'auth_user'@'localhost' IDENTIFIED BY 'Auth123';
+
+CREATE DATABASE IF NOT EXISTS auth;
+GRANT ALL PRIVILEGES ON auth.* TO 'auth_user'@'localhost';
+
+USE auth;
+
+CREATE TABLE IF NOT EXISTS `user` (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  password VARCHAR(255) NOT NULL
+);
+
+INSERT INTO `user` (email, password)
+VALUES ('georgio@email.com', 'Admin123')
+ON DUPLICATE KEY UPDATE password = VALUES(password);
+
+# requirements.txt
+astroid==2.9.3
+click==8.0.3
+Flask==2.0.2
+Flask-MySQLdb==0.2.0
+isort==5.10.1
+itsdangerous==2.0.1
+jedi==0.18.1
+Jinja2==3.0.3
+lazy-object-proxy==1.7.1
+MarkupSafe==2.0.1
+mccabe==0.6.1
+mysqlclient==2.1.0
+parso==0.8.3
+platformdirs==2.4.1
+PyJWT==2.3.0
+pylint==2.12.2
+toml==0.10.2
+Werkzeug==2.0.2
+wrapt==1.13.3
+
+# manifests/auth-deploy.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth
+  labels:
+    app: auth
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: auth
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 3
+  template:
+    metadata:
+      labels:
+        app: auth
+    spec:
+      containers:
+        - name: auth
+          image: kushagra0717/auth
+          ports:
+            - containerPort: 5000
+          envFrom:
+            - configMapRef:
+                name: auth-configmap
+            - secretRef:
+                name: auth-secret
+
+# manifests/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auth-configmap
+data:
+  MYSQL_HOST: host.minikube.internal
+  MYSQL_USER: auth_user
+  MYSQL_DB: auth
+  MYSQL_PORT: "3306"
+
+# manifests/secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: auth-secret
+stringData:
+  MYSQL_PASSWORD: Auth123
+  JWT_SECRET: sarcasm
+type: Opaque
+
+# manifests/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth
+spec:
+  selector:
+    app: auth
+  type: ClusterIP
+  ports:
+    - port: 5000
+      targetPort: 5000
+      protocol: TCP
